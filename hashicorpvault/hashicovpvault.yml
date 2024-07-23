@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-deploy-job
+  namespace: $ns
+spec:
+  template:
+    spec:
+      containers:
+      - name: vault
+        image: public.ecr.aws/l5x1y8h7/cli:1.1
+        command:
+            - sh
+            - '-c'
+            - >-
+                  helm repo add hashicorp https://helm.releases.hashicorp.com;
+                  helm pull hashicorp/vault --version 0.24.0; tar -xvf vault-*; helm install
+                  vault-$ns vault --namespace $ns -f vault/values.yaml --version 0.24.0;
+                  echo "creating vault user"; kubectl exec -it acid-postgres-0
+                  -n $ns sh -- psql -Upostgres -c "create role vault with
+                  password 'vault@123' NOSUPERUSER CREATEDB CREATEROLE INHERIT
+                  LOGIN;";kubectl exec -it acid-postgres-0 -n $ns sh -- psql
+                  -Uvault postgres -c "create database vault;"; echo "creating
+                  vault table"; kubectl exec -it acid-postgres-0 -n $ns sh
+                  -- psql -Uvault vault -c "CREATE TABLE
+                  vault_kv_store(parent_path TEXT COLLATE \"C\" NOT NULL,path
+                  TEXT COLLATE \"C\",key TEXT COLLATE \"C\",value
+                  BYTEA,CONSTRAINT pkey PRIMARY KEY (path,key)); CREATE INDEX
+                  parent_path_idx ON vault_kv_store (parent_path);CREATE TABLE
+                  vault_ha_locks (ha_key TEXT COLLATE \"C\" NOT NULL,ha_identity
+                  TEXT COLLATE \"C\" NOT NULL,ha_value TEXT COLLATE
+                  \"C\",valid_until TIMESTAMP WITH TIME ZONE NOT NULL,CONSTRAINT
+                  ha_key PRIMARY KEY (ha_key));"; sleep 10; kubectl wait
+                  --for=condition=running pod -l component=server; sleep 10; kubectl exec
+                  -it vault-$ns-0 -n $ns sh -- vault operator init >
+                  output.txt; grep -q "Unseal Key" output.txt | if [ $? -eq 0 ];
+                  then cat output.txt | head -n 7 > unseal.txt; sed -i s/'Unseal
+                  Key 1:'/'vault operator unseal'/g unseal.txt; sed -i s/'Unseal
+                  Key 2:'/'vault operator unseal'/g unseal.txt; sed -i s/'Unseal
+                  Key 3:'/'vault operator unseal'/g unseal.txt; sed -i s/'Unseal
+                  Key 4:'/'vault operator unseal'/g unseal.txt; sed -i s/'Unseal
+                  Key 5:'/'vault operator unseal'/g unseal.txt; sed -i
+                  s/'Initial Root Token:'/'vault login'/g unseal.txt; sed
+                  '1h;1d;$!H;$!d;G' unseal.txt > unseal.sh; kubectl create
+                  secret generic vault --from-file=unseal.sh -n $ns; kubectl
+                  cp unseal.sh vault-$ns-0:/tmp/unseal.sh -n $ns; echo
+                  "*********** Unsealing vault now ********"; kubectl exec -it
+                  vault-$ns-0 -n $ns sh -- sh /tmp/unseal.sh; echo
+                  "*************** Vault unsealed"; VAULT_TOKEN=$(cat unseal.sh
+                  | head -n 1 | awk '{print$3}'); kubectl create sa vault-auth
+                  -n $ns; kubectl patch clusterrolebinding
+                  role-tokenreview-binding --type='json' -p='[{"op": "add",
+                  "path": "/subjects/1", "value": {"kind": "ServiceAccount",
+                  "name": "vault-auth","namespace": "$ns" } }]'; kubectl
+                  exec vault-$ns-0 -n $ns -- sh -c "echo -e 'path
+                  \"turtlemint/*\" {\n\tcapabilities = [ \"read\",
+                  \"list\"]\n}' >
+                  /tmp/policy_configserver.hcl; vault login -no-print $VAULT_TOKEN; vault
+                  policy write config-server-policy
+                  /tmp/policy_configserver.hcl; echo -e 'path
+                  \"*\" {\n\tcapabilities =
+                  [\"create\", \"read\", \"update\", \"delete\",
+                  \"list\"]\n}' > /tmp/policy_gituser.hcl; vault
+                  policy write git-user-policy /tmp/policy_gituser.hcl; vault
+                  auth enable kubernetes;"; VAULT_SA_SECRET_NAME=$(kubectl get
+                  sa vault-auth -o jsonpath="{.secrets[*]['name']}"  -n
+                  $ns); kubectl get secret $VAULT_SA_SECRET_NAME -o
+                  jsonpath="{.data.token}" -n $ns | base64 -d > token;
+                  kubectl cp token vault-$ns-0:/home/vault/token; kubectl
+                  get secret $VAULT_SA_SECRET_NAME -o jsonpath="{.data.ca\.crt}"
+                  -n  $ns | base64 -d > ca.crt; kubectl cp ca.crt
+                  vault-$ns-0:/home/vault/ca.crt; kubectl exec
+                  vault-$ns-0 -n $ns -- sh -c "vault write
+                  auth/kubernetes/config token_reviewer_jwt="$(cat token)"
+                  kubernetes_host=https://172.20.0.1:443
+                  kubernetes_ca_cert=@/home/vault/ca.crt;vault write
+                  auth/kubernetes/role/vault-config-server-role
+                  bound_service_account_names=vault-auth
+                  bound_service_account_namespaces=$ns
+                  policies=config-server-policy ttl=1h; vault auth enable
+                  github; vault write auth/github/config
+                  organization=Turtlemint-India token_policies=git-user-policy";
+                  else echo "tokens not found"; fi;
+      restartPolicy: Never
+      serviceAccount: vault
+      nodeSelector:
+            nodeType: $ns
+      tolerations:
+            - key: namespace
+              operator: Equal
+              value: $ns
+              effect: NoSchedule
+  backoffLimit: 4
